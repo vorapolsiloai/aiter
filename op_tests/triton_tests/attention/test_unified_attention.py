@@ -725,3 +725,86 @@ def test_triton_unified_attn(
             torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol),
             f"{torch.max(torch.abs(output - ref_output))}",
         )
+
+
+@pytest.mark.skipif(DEVICE_ARCH != "gfx950", reason="gfx950 Gluon kernel only")
+@pytest.mark.parametrize("block_size", [1, 64])
+@torch.inference_mode()
+def test_gfx950_gluon_runtime_block_table_stride(block_size: int) -> None:
+    seq_lens = [(256, 1024)]
+    (
+        query,
+        _key_cache_orig,
+        _value_cache_orig,
+        key_cache,
+        value_cache,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        q_descale,
+        k_descale,
+        v_descale,
+        output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=2048,
+        block_size=block_size,
+        head_size=256,
+        num_heads=(24, 4),
+        q_dtype=e4m3_dtype,
+        kv_dtype=e4m3_dtype,
+        out_dtype=torch.bfloat16,
+        shuffled_kv_cache=False,
+        device="cuda",
+    )
+
+    outputs = []
+    for padding in (0, 1, 7):
+        padded_block_tables = torch.zeros(
+            (
+                block_tables.shape[0],
+                block_tables.shape[1] + padding,
+            ),
+            dtype=block_tables.dtype,
+            device=block_tables.device,
+        )
+        padded_block_tables[:, : block_tables.shape[1]].copy_(block_tables)
+        unified_attention(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            out=output,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=kv_lens,
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_kv_len,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window_size,
+            block_table=padded_block_tables,
+            softcap=0,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            sinks=sinks,
+            output_scale=output_scale,
+            shuffled_kv_cache=False,
+            backend="gluon",
+        )
+        outputs.append(output.clone())
+
+    for padded_output in outputs[1:]:
+        torch.testing.assert_close(
+            padded_output,
+            outputs[0],
+            atol=2e-5,
+            rtol=0,
+        )
